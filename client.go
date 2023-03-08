@@ -2,24 +2,25 @@ package goar
 
 import (
 	"bytes"
+	"container/ring"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"github.com/inconshreveable/log15"
-	"github.com/panjf2000/ants/v2"
-	"github.com/tidwall/gjson"
-	"gopkg.in/h2non/gentleman.v2"
 	"io/ioutil"
 	"math/big"
 	"net/http"
 	"net/url"
-	"os"
 	"path"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	sentinel "github.com/alibaba/sentinel-golang/api"
+	"github.com/alibaba/sentinel-golang/core/circuitbreaker"
+	"github.com/alibaba/sentinel-golang/core/config"
+	"github.com/alibaba/sentinel-golang/logging"
 	"github.com/everFinance/goar/types"
 	"github.com/everFinance/goar/utils"
 )
@@ -27,10 +28,23 @@ import (
 var log = log15.New("module", "goar")
 
 // arweave HTTP API: https://docs.arweave.org/developers/server/http-api
+type PeerStatus struct {
+	Count     int
+	SucCount  int
+	FailCount int
+}
+
+func (ps *PeerStatus) String() string {
+	return fmt.Sprintf("count=%v||success=%v||fail=%v", ps.Count, ps.SucCount, ps.FailCount)
+}
 
 type Client struct {
-	client *http.Client
-	url    string
+	client     *http.Client
+	url        string
+	rules      []*circuitbreaker.Rule
+	peers      *ring.Ring
+	lock       sync.Mutex
+	PeerStatus map[string]*PeerStatus
 }
 
 func NewClient(nodeUrl string, proxyUrl ...string) *Client {
@@ -50,6 +64,45 @@ func NewClient(nodeUrl string, proxyUrl ...string) *Client {
 	return &Client{client: httpClient, url: nodeUrl}
 }
 
+func NewClientWithPeers(nodeUrl string, peers []string, listener circuitbreaker.StateChangeListener, proxyUrl ...string) *Client {
+	log.SetHandler(log15.StdoutHandler)
+	client := NewClient(nodeUrl, proxyUrl...)
+	client.peers = ring.New(len(peers))
+	client.PeerStatus = make(map[string]*PeerStatus)
+	for _, p := range peers {
+		client.peers.Value = p
+		client.peers = client.peers.Next()
+		client.PeerStatus[p] = &PeerStatus{}
+	}
+	client.rules = make([]*circuitbreaker.Rule, len(peers))
+	for idx, peer := range peers {
+		client.rules[idx] = &circuitbreaker.Rule{
+			Resource:                     peer,
+			Strategy:                     circuitbreaker.ErrorRatio,
+			RetryTimeoutMs:               1000 * 60 * 30,
+			MinRequestAmount:             10,
+			StatIntervalMs:               1000 * 60 * 5,
+			StatSlidingWindowBucketCount: 1000 * 60 * 1,
+			Threshold:                    0.8,
+		}
+	}
+	conf := config.NewDefaultConfig()
+	// for testing, logging output to console
+	conf.Sentinel.Log.Logger = logging.NewConsoleLogger()
+	err := sentinel.InitWithConfig(conf)
+	if err != nil {
+		panic(err)
+	}
+	// Register a state change listener so that we could observer the state change of the internal circuit breaker.
+	circuitbreaker.RegisterStateChangeListeners(listener)
+
+	_, err = circuitbreaker.LoadRules(client.rules)
+	if err != nil {
+		panic(err)
+	}
+	return client
+}
+
 func NewTempConn() *Client {
 	transport := http.Transport{DisableKeepAlives: true}
 	cli := &http.Client{Transport: &transport}
@@ -66,9 +119,6 @@ func (c *Client) SetTimeout(timeout time.Duration) {
 
 func (c *Client) GetInfo() (info *types.NetworkInfo, err error) {
 	body, code, err := c.httpGet("info")
-	if code == 429 {
-		return nil, ErrRequestLimit
-	}
 	if err != nil {
 		return nil, ErrBadGateway
 	}
@@ -83,9 +133,6 @@ func (c *Client) GetInfo() (info *types.NetworkInfo, err error) {
 
 func (c *Client) GetPeers() ([]string, error) {
 	body, code, err := c.httpGet("peers")
-	if code == 429 {
-		return nil, ErrRequestLimit
-	}
 	if err != nil {
 		return nil, ErrBadGateway
 	}
@@ -130,8 +177,6 @@ func (c *Client) GetTransactionByID(id string) (tx *types.Transaction, err error
 		return nil, ErrInvalidId
 	case 404:
 		return nil, ErrNotFound
-	case 429:
-		return nil, ErrRequestLimit
 	default:
 		return nil, ErrBadGateway
 	}
@@ -154,8 +199,6 @@ func (c *Client) GetTransactionStatus(id string) (*types.TxStatus, error) {
 		return nil, ErrPendingTx
 	case 404:
 		return nil, ErrNotFound
-	case 429:
-		return nil, ErrRequestLimit
 	default:
 		return nil, ErrBadGateway
 	}
@@ -176,8 +219,6 @@ func (c *Client) GetTransactionField(id string, field string) (string, error) {
 		return "", ErrInvalidId
 	case 404:
 		return "", ErrNotFound
-	case 429:
-		return "", ErrRequestLimit
 	default:
 		return "", ErrBadGateway
 	}
@@ -216,6 +257,15 @@ func (c *Client) GetTransactionData(id string, extension ...string) ([]byte, err
 		if len(data) == 0 {
 			return c.DownloadChunkData(id)
 		}
+
+		if data != nil && len(data) != 0 {
+			dst := make([]byte, len(data))
+			_, err = utils.Base64Decode(string(data))
+			if err != nil {
+				return nil, fmt.Errorf("base64 decode err,err=%v,data=%v", err, data)
+			}
+			data = dst
+		}
 		return data, nil
 	case 400:
 		return c.DownloadChunkData(id)
@@ -223,43 +273,6 @@ func (c *Client) GetTransactionData(id string, extension ...string) ([]byte, err
 		return nil, ErrPendingTx
 	case 404:
 		return nil, ErrNotFound
-	case 429:
-		return nil, ErrRequestLimit
-	default:
-		return nil, ErrBadGateway
-	}
-}
-
-func (c *Client) GetTransactionDataStream(id string, extension ...string) (*os.File, error) {
-	urlPath := fmt.Sprintf("tx/%v/%v", id, "data")
-	if extension != nil {
-		urlPath = urlPath + "." + extension[0]
-	}
-	data, statusCode, err := c.httpGet(urlPath)
-	if err != nil {
-		return nil, fmt.Errorf("httpGet error: %v", err)
-	}
-
-	// When data is bigger than 12MiB statusCode == 400 NOTE: Data bigger than that has to be downloaded chunk by chunk.
-	switch statusCode {
-	case 200:
-		if len(data) == 0 {
-			return c.DownloadChunkDataStream(id)
-		}
-		dataFile, err := os.CreateTemp(".", "arTxData-")
-		if err != nil {
-			return nil, err
-		}
-		_, err = dataFile.Write(data)
-		return dataFile, err
-	case 400:
-		return c.DownloadChunkDataStream(id)
-	case 202:
-		return nil, ErrPendingTx
-	case 404:
-		return nil, ErrNotFound
-	case 429:
-		return nil, ErrRequestLimit
 	default:
 		return nil, ErrBadGateway
 	}
@@ -269,9 +282,6 @@ func (c *Client) GetTransactionDataStream(id string, extension ...string) (*os.F
 func (c *Client) GetTransactionDataByGateway(id string) (body []byte, err error) {
 	urlPath := fmt.Sprintf("/%v/%v", id, "data")
 	body, statusCode, err := c.httpGet(urlPath)
-	if err != nil {
-		return nil, fmt.Errorf("httpGet error: %v", err)
-	}
 	switch statusCode {
 	case 200:
 		if len(body) == 0 {
@@ -286,55 +296,18 @@ func (c *Client) GetTransactionDataByGateway(id string) (body []byte, err error)
 		return nil, ErrNotFound
 	case 410:
 		return nil, ErrInvalidId
-	case 429:
-		return nil, ErrRequestLimit
 	default:
 		return nil, ErrBadGateway
 	}
 }
 
-func (c *Client) GetTransactionDataStreamByGateway(id string) (*os.File, error) {
-	urlPath := fmt.Sprintf("/%v/%v", id, "data")
-	body, statusCode, err := c.httpGet(urlPath)
-	if err != nil {
-		return nil, fmt.Errorf("httpGet error: %v", err)
-	}
-	switch statusCode {
-	case 200:
-		if len(body) == 0 {
-			return c.DownloadChunkDataStream(id)
-		}
-		dataFile, err := os.CreateTemp(".", "arTxData-")
-		if err != nil {
-			return nil, err
-		}
-		_, err = dataFile.Write(body)
-		return dataFile, err
-	case 400:
-		return c.DownloadChunkDataStream(id)
-	case 202:
-		return nil, ErrPendingTx
-	case 404:
-		return nil, ErrNotFound
-	case 410:
-		return nil, ErrInvalidId
-	case 429:
-		return nil, ErrRequestLimit
-	default:
-		return nil, ErrBadGateway
-	}
-}
-
-func (c *Client) GetTransactionPrice(dataSize int, target *string) (reward int64, err error) {
-	url := fmt.Sprintf("price/%d", dataSize)
+func (c *Client) GetTransactionPrice(data []byte, target *string) (reward int64, err error) {
+	url := fmt.Sprintf("price/%d", len(data))
 	if target != nil {
 		url = fmt.Sprintf("%v/%v", url, *target)
 	}
 
 	body, code, err := c.httpGet(url)
-	if code == 429 {
-		return 0, ErrRequestLimit
-	}
 	if err != nil {
 		return
 	}
@@ -356,9 +329,6 @@ func (c *Client) GetTransactionPrice(dataSize int, target *string) (reward int64
 
 func (c *Client) GetTransactionAnchor() (anchor string, err error) {
 	body, code, err := c.httpGet("tx_anchor")
-	if code == 429 {
-		return "", ErrRequestLimit
-	}
 	if err != nil {
 		return
 	}
@@ -413,9 +383,6 @@ func (c *Client) GraphQL(query string) ([]byte, error) {
 
 	// query from http client
 	data, statusCode, err := c.httpPost("graphql", byQuery)
-	if statusCode == 429 {
-		return nil, ErrRequestLimit
-	}
 	if err != nil {
 		return nil, err
 	}
@@ -438,9 +405,6 @@ func (c *Client) GraphQL(query string) ([]byte, error) {
 // Wallet
 func (c *Client) GetWalletBalance(address string) (arAmount *big.Float, err error) {
 	body, code, err := c.httpGet(fmt.Sprintf("wallet/%s/balance", address))
-	if code == 429 {
-		return nil, ErrRequestLimit
-	}
 	if err != nil {
 		return
 	}
@@ -461,9 +425,6 @@ func (c *Client) GetWalletBalance(address string) (arAmount *big.Float, err erro
 
 func (c *Client) GetLastTransactionID(address string) (id string, err error) {
 	body, code, err := c.httpGet(fmt.Sprintf("wallet/%s/last_tx", address))
-	if code == 429 {
-		return "", ErrRequestLimit
-	}
 	if err != nil {
 		return
 	}
@@ -481,9 +442,6 @@ func (c *Client) GetBlockByID(id string) (block *types.Block, err error) {
 	if err != nil {
 		return
 	}
-	if code == 429 {
-		return nil, ErrRequestLimit
-	}
 
 	if code != 200 {
 		return nil, fmt.Errorf("get block by id error: %s", string(body))
@@ -496,9 +454,6 @@ func (c *Client) GetBlockByHeight(height int64) (block *types.Block, err error) 
 	body, code, err := c.httpGet(fmt.Sprintf("block/height/%d", height))
 	if err != nil {
 		return
-	}
-	if code == 429 {
-		return nil, ErrRequestLimit
 	}
 
 	if code != 200 {
@@ -551,11 +506,8 @@ func (c *Client) httpPost(_path string, payload []byte) (body []byte, statusCode
 func (c *Client) getChunk(offset int64) (*types.TransactionChunk, error) {
 	_path := "chunk/" + strconv.FormatInt(offset, 10)
 	body, statusCode, err := c.httpGet(_path)
-	if statusCode == 429 {
-		return nil, ErrRequestLimit
-	}
 	if statusCode != 200 {
-		return nil, errors.New("not found chunk data")
+		return nil, fmt.Errorf("not found chunk data,statusCode=%v,err=%v", statusCode, err)
 	}
 	if err != nil {
 		return nil, err
@@ -578,9 +530,6 @@ func (c *Client) getChunkData(offset int64) ([]byte, error) {
 func (c *Client) getTransactionOffset(id string) (*types.TransactionOffset, error) {
 	_path := fmt.Sprintf("tx/%s/offset", id)
 	body, statusCode, err := c.httpGet(_path)
-	if statusCode == 429 {
-		return nil, ErrRequestLimit
-	}
 	if statusCode != 200 {
 		return nil, errors.New("not found tx offset")
 	}
@@ -621,272 +570,6 @@ func (c *Client) DownloadChunkData(id string) ([]byte, error) {
 	return data, nil
 }
 
-// it's caller's responsibility to reserve or delete the tmp file created by this method
-
-func (c *Client) DownloadChunkDataStream(id string) (*os.File, error) {
-	offsetResponse, err := c.getTransactionOffset(id)
-	if err != nil {
-		return nil, err
-	}
-	size, err := strconv.ParseInt(offsetResponse.Size, 10, 64)
-	if err != nil {
-		return nil, err
-	}
-	endOffset, err := strconv.ParseInt(offsetResponse.Offset, 10, 64)
-	if err != nil {
-		return nil, err
-	}
-	startOffset := endOffset - size + 1
-	dataFile, err := os.CreateTemp(".", "chunkData-")
-	if err != nil {
-		return nil, err
-	}
-	downloadSize := 0
-	n := 0
-	for i := 0; int64(i)+startOffset < endOffset; {
-		chunkData, err := c.getChunkData(int64(i) + startOffset)
-		if err != nil {
-			return nil, err
-		}
-		downloadSize += len(chunkData)
-		n, err = dataFile.Write(chunkData)
-		if err != nil || n < len(chunkData) {
-			return nil, fmt.Errorf("write chunkData to dataFile failed")
-		}
-		fmt.Printf("download chunk data; offset: %d/%d; size: %d/%d \n", int64(i)+startOffset, endOffset, downloadSize, size)
-		i += len(chunkData)
-	}
-	return dataFile, nil
-}
-
-func (c *Client) ConcurrentDownloadChunkData(id string, concurrentNum int) ([]byte, error) {
-	offsetResponse, err := c.getTransactionOffset(id)
-	if err != nil {
-		return nil, err
-	}
-	size, err := strconv.ParseInt(offsetResponse.Size, 10, 64)
-	if err != nil {
-		return nil, err
-	}
-	endOffset, err := strconv.ParseInt(offsetResponse.Offset, 10, 64)
-	if err != nil {
-		return nil, err
-	}
-	startOffset := endOffset - size + 1
-
-	offsetArr := make([]int64, 0, 5)
-	for i := 0; int64(i)+startOffset < endOffset; {
-		offsetArr = append(offsetArr, int64(i)+startOffset)
-		i += types.MAX_CHUNK_SIZE
-	}
-
-	if len(offsetArr) <= 3 { // not need concurrent get chunks
-		return c.DownloadChunkData(id)
-	}
-
-	log.Debug("need download chunks length", "length", len(offsetArr))
-	// concurrent get chunks
-	type OffsetSort struct {
-		Idx    int
-		Offset int64
-	}
-
-	chunkArr := make([][]byte, len(offsetArr)-2)
-	var (
-		lock sync.Mutex
-		wg   sync.WaitGroup
-	)
-	if concurrentNum <= 0 {
-		concurrentNum = types.DEFAULT_CHUNK_CONCURRENT_NUM
-	}
-	p, _ := ants.NewPoolWithFunc(concurrentNum, func(i interface{}) {
-		defer wg.Done()
-		oss := i.(OffsetSort)
-		chunkData, err := c.getChunkData(oss.Offset)
-		if err != nil {
-			count := 0
-			for count < 2 {
-				time.Sleep(1 * time.Second)
-				chunkData, err = c.getChunkData(oss.Offset)
-				if err == nil {
-					break
-				}
-				log.Error("retry getChunkData failed and try again...", "err", err, "idx", oss.Idx, "offset", oss.Offset, "retryCount", count, "arId", id)
-				if err != ErrRequestLimit {
-					count++
-				}
-			}
-		}
-		lock.Lock()
-		chunkArr[oss.Idx] = chunkData
-		lock.Unlock()
-	})
-
-	defer p.Release()
-
-	for i, offset := range offsetArr[:len(offsetArr)-2] {
-		wg.Add(1)
-		if err := p.Invoke(OffsetSort{Idx: i, Offset: offset}); err != nil {
-			log.Error("p.Invoke(i)", "err", err, "i", i)
-			return nil, err
-		}
-	}
-	wg.Wait()
-
-	// add latest 2 chunks
-	start := offsetArr[len(offsetArr)-3] + types.MAX_CHUNK_SIZE
-	for i := 0; int64(i)+start < endOffset; {
-		chunkData, err := c.getChunkData(int64(i) + start)
-		if err != nil {
-			count := 0
-			for count < 2 {
-				time.Sleep(1 * time.Second)
-				chunkData, err = c.getChunkData(int64(i) + start)
-				if err == nil {
-					break
-				}
-				log.Error("latest two chunks retry getChunkData failed and try again...", "err", err, "offset", int64(i)+start, "retryCount", count, "arId", id)
-				if err != ErrRequestLimit {
-					count++
-				}
-			}
-		}
-		if err != nil {
-			return nil, errors.New("concurrent get latest two chunks failed")
-		}
-		chunkArr = append(chunkArr, chunkData)
-		i += len(chunkData)
-	}
-
-	// assemble data
-	data := make([]byte, 0, size)
-	for _, chunk := range chunkArr {
-		if chunk == nil {
-			return nil, errors.New("concurrent get chunk failed")
-		}
-		data = append(data, chunk...)
-	}
-	return data, nil
-}
-
-// it's caller's responsibility to reserve or delete the tmp file created by this method
-
-func (c *Client) ConcurrentDownloadChunkDataStream(id string, concurrentNum int) (*os.File, []byte, error) {
-	offsetResponse, err := c.getTransactionOffset(id)
-	if err != nil {
-		return nil, nil, err
-	}
-	size, err := strconv.ParseInt(offsetResponse.Size, 10, 64)
-	if err != nil {
-		return nil, nil, err
-	}
-	endOffset, err := strconv.ParseInt(offsetResponse.Offset, 10, 64)
-	if err != nil {
-		return nil, nil, err
-	}
-	startOffset := endOffset - size + 1
-
-	offsetArr := make([]int64, 0, 5)
-	for i := 0; int64(i)+startOffset < endOffset; {
-		offsetArr = append(offsetArr, int64(i))
-		i += types.MAX_CHUNK_SIZE
-	}
-
-	if len(offsetArr) <= 3 { // not need concurrent get chunks
-		data, err := c.DownloadChunkData(id)
-		return nil, data, err
-	}
-
-	log.Debug("need download chunks length", "length", len(offsetArr))
-
-	dataFile, err := os.CreateTemp(".", "concurrent-load-chunks-")
-	if err != nil {
-		return nil, nil, err
-	}
-	type Offset struct {
-		fileOffset  int64
-		chunkOffset int64
-	}
-	var (
-		lock sync.Mutex
-		wg   sync.WaitGroup
-	)
-	if concurrentNum <= 0 {
-		concurrentNum = types.DEFAULT_CHUNK_CONCURRENT_NUM
-	}
-	p, _ := ants.NewPoolWithFunc(concurrentNum, func(i interface{}) {
-		defer wg.Done()
-		oss := i.(Offset)
-		chunkData, err := c.getChunkData(oss.chunkOffset)
-		if err != nil {
-			count := 0
-			for count < 2 {
-				time.Sleep(1 * time.Second)
-				chunkData, err = c.getChunkData(oss.chunkOffset)
-				if err == nil {
-					break
-				}
-				log.Error("retry getChunkData failed and try again...", "err", err, "idx", oss.fileOffset/types.MAX_CHUNK_SIZE, "offset", oss.chunkOffset, "retryCount", count, "arId", id)
-				if err != ErrRequestLimit {
-					count++
-				}
-			}
-		}
-		var n int
-		lock.Lock()
-		n, err = dataFile.WriteAt(chunkData, oss.fileOffset)
-		if err != nil || n < len(chunkData) {
-			log.Error("write dataFile error")
-		}
-		lock.Unlock()
-	})
-
-	defer p.Release()
-
-	for i, offset := range offsetArr[:len(offsetArr)-2] {
-		wg.Add(1)
-		if err := p.Invoke(Offset{fileOffset: offset, chunkOffset: offset + startOffset}); err != nil {
-			log.Error("p.Invoke(i)", "err", err, "i", i)
-			return nil, nil, err
-		}
-	}
-	wg.Wait()
-	_, err = dataFile.Seek(0, 2)
-	if err != nil {
-		return nil, nil, err
-	}
-	// add latest 2 chunks
-	start := offsetArr[len(offsetArr)-3] + startOffset + types.MAX_CHUNK_SIZE
-	for i := 0; int64(i)+start < endOffset; {
-		chunkData, err := c.getChunkData(int64(i) + start)
-		if err != nil {
-			count := 0
-			for count < 2 {
-				time.Sleep(1 * time.Second)
-				chunkData, err = c.getChunkData(int64(i) + start)
-				if err == nil {
-					break
-				}
-				log.Error("latest two chunks retry getChunkData failed and try again...", "err", err, "offset", int64(i)+start, "retryCount", count, "arId", id)
-				if err != ErrRequestLimit {
-					count++
-				}
-			}
-		}
-		if err != nil {
-			return nil, nil, errors.New("concurrent get latest two chunks failed")
-		}
-		n := 0
-		n, err = dataFile.Write(chunkData)
-		if err != nil || n < len(chunkData) {
-			return nil, nil, fmt.Errorf("write dataFile error writeSize:%d, expectSize:%d", n, len(chunkData))
-		}
-		i += len(chunkData)
-	}
-
-	return dataFile, nil, nil
-}
-
 func (c *Client) GetUnconfirmedTx(arId string) (*types.Transaction, error) {
 	_path := fmt.Sprintf("unconfirmed_tx/%s", arId)
 	body, statusCode, err := c.httpGet(_path)
@@ -918,11 +601,8 @@ func (c *Client) GetPendingTxIds() ([]string, error) {
 	return res, nil
 }
 
-func (c *Client) GetBlockHashList(from, to int) ([]string, error) {
-	if from > to {
-		return nil, errors.New("from must <= to")
-	}
-	body, statusCode, err := c.httpGet("/hash_list/" + strconv.Itoa(from) + "/" + strconv.Itoa(to))
+func (c *Client) GetBlockHashList() ([]string, error) {
+	body, statusCode, err := c.httpGet("/hash_list")
 	if statusCode != 200 {
 		return nil, errors.New("get block hash list failed")
 	}
@@ -935,71 +615,4 @@ func (c *Client) GetBlockHashList(from, to int) ([]string, error) {
 		return nil, err
 	}
 	return res, nil
-}
-
-func (c *Client) ExistTxData(arId string) (bool, error) {
-	offsetResponse, err := c.getTransactionOffset(arId)
-	if err != nil {
-		return false, err
-	}
-	endOffset := offsetResponse.Offset
-
-	records, err := c.DataSyncRecord(endOffset, 1)
-	if err != nil {
-		return false, err
-	}
-	if len(records) == 0 {
-		return false, errors.New("c.DataSyncRecord(endOffset,1) is null")
-	}
-	record := records[0]
-
-	// if tx data has end offset 145 and size 10 (you can see it in GET /tx/<id>/offset),
-	// you can query GET /data_sync_record/145/1
-	// - you will receive {"<end>": "<start>"} => the node has the tx data if start =< 145 - 10
-	mmp := gjson.Parse(record).Map()
-	start := ""
-	for _, val := range mmp {
-		start = val.String()
-		break
-	}
-	startNum, err := strconv.Atoi(start)
-	if err != nil {
-		return false, err
-	}
-	endOffsetNum, err := strconv.Atoi(endOffset)
-	if err != nil {
-		return false, err
-	}
-	sizeNum, err := strconv.Atoi(offsetResponse.Size)
-	if err != nil {
-		return false, err
-	}
-
-	return startNum <= endOffsetNum-sizeNum, nil
-}
-
-// DataSyncRecord you can use GET /data_sync_record/<end_offset>/<number_of_intervals>
-// to fetch the first intervals with end offset >= end_offset;
-// set Content-Type: application/json to get the reply in JSON
-func (c *Client) DataSyncRecord(endOffset string, intervalsNum int) ([]string, error) {
-	req := gentleman.New().URL(c.url).Request()
-	req.AddPath("/data_sync_record/" + endOffset + "/" + strconv.Itoa(intervalsNum))
-	req.SetHeader("Content-Type", "application/json")
-	resp, err := req.Send()
-	if err != nil {
-		return nil, err
-	}
-	if resp.StatusCode == 429 {
-		return nil, ErrRequestLimit
-	}
-	if !resp.Ok {
-		return nil, errors.New("resp ok is false")
-	}
-	defer resp.Close()
-	ss := gjson.ParseBytes(resp.Bytes()).Array()
-	result := make([]string, 0, len(ss))
-	for _, s := range ss {
-		result = append(result, s.String())
-	}
-	return result, nil
 }

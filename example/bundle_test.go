@@ -1,20 +1,14 @@
 package example
 
 import (
-	"context"
-	"errors"
-	"io"
-	"io/ioutil"
-	"math/big"
-	"os"
-	"testing"
-
 	"github.com/everFinance/everpay-go/sdk"
 	"github.com/everFinance/goar"
 	"github.com/everFinance/goar/types"
 	"github.com/everFinance/goar/utils"
 	"github.com/everFinance/goether"
 	"github.com/stretchr/testify/assert"
+	"math/big"
+	"testing"
 )
 
 var (
@@ -76,48 +70,7 @@ func TestBundleToArweave(t *testing.T) {
 
 	// send to arweave
 	wal, err := goar.NewWalletFromPath("jwkKey.json", "https://arweave.net")
-	assert.NoError(t, err)
-	tx, err := wal.SendBundleTx(context.TODO(), 0, bundle.BundleBinary, []types.Tag{
-		{Name: "App", Value: "goar"},
-	})
-	assert.NoError(t, err)
-	t.Log(tx.ID)
-}
-
-func TestNestedBundleToArweave(t *testing.T) {
-	// sig item01 by ecc signer
-	itemSigner01, err := goar.NewItemSigner(signer01)
-	assert.NoError(t, err)
-	item01, err := itemSigner01.CreateAndSignItem([]byte("aa bb cc"), "", "", []types.Tag{
-		{Name: "Content-Type", Value: "application/txt"},
-		{Name: "App-Version", Value: "2.0.0"},
-	})
-	assert.NoError(t, err)
-
-	// sig item02 by rsa signer
-	itemSigner02, err := goar.NewItemSigner(signer02)
-	assert.NoError(t, err)
-	item02, err := itemSigner02.CreateAndSignItem([]byte("dd ee ff"), "", "", []types.Tag{
-		{Name: "Content-Type", Value: "application/txt"},
-	})
-	assert.NoError(t, err)
-
-	// assemble item to nested bundle
-	nestedItem, err := itemSigner01.CreateAndSignNestedItem("", "", []types.Tag{}, item01, item02)
-	assert.NoError(t, err)
-	item03, err := itemSigner02.CreateAndSignItem([]byte("gg hh ii"), "", "", []types.Tag{
-		{Name: "Content-Type", Value: "application/txt"},
-	})
-	assert.NoError(t, err)
-
-	// assemble bundle
-	bundle, err := utils.NewBundle(nestedItem, item03)
-	assert.NoError(t, err)
-
-	// send to arweave
-	wal, err := goar.NewWalletFromPath("jwkKey.json", "https://arweave.net")
-	assert.NoError(t, err)
-	tx, err := wal.SendBundleTx(context.TODO(), 0, bundle.BundleBinary, []types.Tag{
+	tx, err := wal.SendBundleTx(bundle.BundleBinary, []types.Tag{
 		{Name: "App", Value: "goar"},
 	})
 	assert.NoError(t, err)
@@ -183,199 +136,4 @@ func TestVerifyBundleItem(t *testing.T) {
 		err = utils.VerifyBundleItem(item)
 		assert.NoError(t, err)
 	}
-}
-
-func TestDecodeBundleItemStream(t *testing.T) {
-	cli := goar.NewClient("https://arweave.net")
-
-	id := "lt24bnUGms5XLZeVamSPHePl4M2ClpLQyRxZI7weH1k"
-	data, err := cli.DownloadChunkData(id)
-	assert.NoError(t, err)
-	bd, err := utils.DecodeBundle(data)
-	assert.NoError(t, err)
-	item := bd.Items[1]
-	err = os.WriteFile("test2.item", item.ItemBinary, 0644)
-	assert.NoError(t, err)
-	itemReader, err := os.Open("test2.item")
-	defer itemReader.Close()
-	assert.NoError(t, err)
-	item2, err := utils.DecodeBundleItemStream(itemReader)
-	assert.NoError(t, err)
-	assert.Equal(t, item2.Id, item.Id)
-	bundleData, err := io.ReadAll(item2.DataReader)
-	assert.NoError(t, err)
-	assert.Equal(t, item.Data, utils.Base64Encode(bundleData))
-}
-
-func TestIOBuffer(t *testing.T) {
-	itemReader, err := os.Open("test.item")
-	assert.NoError(t, err)
-	assert.Equal(t, itemReader.Name(), "test.item")
-	itemBinary, err := ioutil.ReadFile("test.item")
-	assert.NoError(t, err)
-	defer itemReader.Close()
-	item, err := utils.DecodeBundleItemStream(itemReader)
-	assert.NoError(t, err)
-	_, err = item.DataReader.Seek(0, 0)
-	assert.NoError(t, err)
-	itemBinary2, err := io.ReadAll(item.DataReader)
-	assert.NoError(t, err)
-	assert.Equal(t, item.DataReader.Name(), "test.item")
-	assert.Equal(t, itemBinary2, itemBinary)
-}
-
-func TestIOBuffere(t *testing.T) {
-	itemReader, err := os.Open("test.item")
-	assert.NoError(t, err)
-	defer itemReader.Close()
-	item, err := utils.DecodeBundleItemStream(itemReader)
-	assert.NoError(t, err)
-	by, err := io.ReadAll(item.DataReader)
-	assert.NoError(t, err)
-	t.Log(len(by))
-}
-
-func TestCreateBundleItemStream(t *testing.T) {
-	data0, err := ioutil.ReadFile("../go.mod")
-	assert.NoError(t, err)
-	data1, err := os.Open("../go.mod")
-	assert.NoError(t, err)
-	itemSigner, err := goar.NewItemSigner(signer01)
-	assert.NoError(t, err)
-	item0, err := itemSigner.CreateAndSignItem(data0, "", "", []types.Tag{
-		{Name: "Content-Type", Value: "application/txt"},
-		{Name: "App-Version", Value: "2.0.0"},
-	})
-	assert.NoError(t, err)
-	item1, err := itemSigner.CreateAndSignItemStream(data1, "", "", []types.Tag{
-		{Name: "Content-Type", Value: "application/txt"},
-		{Name: "App-Version", Value: "2.0.0"},
-	})
-	assert.Equal(t, item0.Signature, item1.Signature)
-}
-
-func TestPointerAndValueCopy(t *testing.T) {
-	data0, err := ioutil.ReadFile("../go.mod")
-	assert.NoError(t, err)
-	data, err := os.Open("../go.mod")
-	assert.NoError(t, err)
-	itemSigner, err := goar.NewItemSigner(signer01)
-	assert.NoError(t, err)
-	item, err := itemSigner.CreateAndSignItemStream(data, "", "", []types.Tag{
-		{Name: "Content-Type", Value: "application/txt"},
-		{Name: "App-Version", Value: "2.0.0"},
-	})
-	assert.NoError(t, err)
-	err = changeData(item)
-	assert.NoError(t, err)
-	data2, err := io.ReadAll(item.DataReader)
-	assert.NoError(t, err)
-	assert.NotEqual(t, data0, data2)
-	assert.Equal(t, data0[1:], data2)
-	n, err := item.DataReader.Seek(0, 2)
-	assert.Equal(t, int(n), len(data0))
-}
-
-func TestReader(t *testing.T) {
-	data, err := os.Open("../go.mod")
-	defer data.Close()
-	assert.NoError(t, err)
-	data2, err := ioutil.ReadFile("../go.mod")
-	itemSigner, err := goar.NewItemSigner(signer01)
-	assert.NoError(t, err)
-	item, err := itemSigner.CreateAndSignItemStream(data, "", "", []types.Tag{
-		{Name: "Content-Type", Value: "application/txt"},
-		{Name: "App-Version", Value: "2.0.0"},
-	})
-	assert.NoError(t, err)
-	item2, err := itemSigner.CreateAndSignItem(data2, "", "", []types.Tag{
-		{Name: "Content-Type", Value: "application/txt"},
-		{Name: "App-Version", Value: "2.0.0"},
-	})
-	assert.NoError(t, err)
-
-	binaryReader, err := utils.GenerateItemBinaryStream(&item)
-	assert.NoError(t, err)
-	binary, err := io.ReadAll(binaryReader)
-
-	assert.Equal(t, binary, item2.ItemBinary)
-}
-
-func TestVerifyItemStream(t *testing.T) {
-	itemReader, err := os.Open("test.item")
-	defer itemReader.Close()
-	assert.NoError(t, err)
-	item, err := utils.DecodeBundleItemStream(itemReader)
-	assert.NoError(t, err)
-	err = utils.VerifyBundleItem(*item)
-	assert.NoError(t, err)
-}
-
-func TestNewBundleStream(t *testing.T) {
-	binary01, err := os.Open("test.item")
-	assert.NoError(t, err)
-	binary02, err := os.Open("test2.item")
-	assert.NoError(t, err)
-	item01, err := utils.DecodeBundleItemStream(binary01)
-	assert.NoError(t, err)
-	item02, err := utils.DecodeBundleItemStream(binary02)
-	bundle, err := utils.NewBundleStream(*item01, *item02)
-	assert.NoError(t, err)
-	defer os.Remove(bundle.BundleDataReader.Name())
-	bundleData, err := io.ReadAll(bundle.BundleDataReader)
-	assert.NoError(t, err)
-	bundle02, err := utils.DecodeBundle(bundleData)
-	assert.NoError(t, err)
-	assert.Equal(t, item01.Signature, bundle02.Items[0].Signature)
-}
-
-func TestAAA(t *testing.T) {
-	binary01, err := os.Open("test.item")
-	assert.NoError(t, err)
-	binary02, err := os.Open("test2.item")
-	assert.NoError(t, err)
-	item01, err := utils.DecodeBundleItemStream(binary01)
-	assert.NoError(t, err)
-	item02, err := utils.DecodeBundleItemStream(binary02)
-	assert.NoError(t, err)
-	bundle, err := utils.NewBundleStream(*item01, *item02)
-	assert.NoError(t, err)
-	_, err = utils.DecodeBundleStream(bundle.BundleDataReader)
-	assert.NoError(t, err)
-
-	by, err := io.ReadAll(bundle.BundleDataReader)
-	assert.NoError(t, err)
-	t.Log(len(by))
-
-}
-
-func TestDecodeBundleStream(t *testing.T) {
-	binary01, err := os.Open("test.item")
-	assert.NoError(t, err)
-	binary02, err := os.Open("test2.item")
-	assert.NoError(t, err)
-	item01, err := utils.DecodeBundleItemStream(binary01)
-	assert.NoError(t, err)
-	item02, err := utils.DecodeBundleItemStream(binary02)
-
-	bundleData, err := os.Open("bundleData")
-	assert.NoError(t, err)
-	bundle, err := utils.DecodeBundleStream(bundleData)
-	assert.NoError(t, err)
-	assert.Equal(t, item01.Signature, bundle.Items[0].Signature)
-	assert.Equal(t, item02.Signature, bundle.Items[1].Signature)
-	for _, item := range bundle.Items {
-		os.Remove(item.DataReader.Name())
-	}
-	os.Remove(item01.DataReader.Name())
-	os.Remove(item02.DataReader.Name())
-}
-
-func changeData(item types.BundleItem) error {
-	b := make([]byte, 1)
-	n, err := item.DataReader.Read(b)
-	if n < 1 || err != nil {
-		return errors.New("err")
-	}
-	return nil
 }

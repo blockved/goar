@@ -3,7 +3,6 @@ package goar
 import (
 	"github.com/everFinance/goar/utils"
 	"github.com/stretchr/testify/assert"
-	"io/ioutil"
 	"testing"
 )
 
@@ -208,8 +207,7 @@ func Test_GetTxDataFromPeers(t *testing.T) {
 	t.Log(len(data))
 
 	// verify data root
-	chunks, err := utils.GenerateChunks(data)
-	assert.NoError(t, err)
+	chunks := utils.GenerateChunks(data)
 	dataRoot := utils.Base64Encode(chunks.DataRoot)
 	tx, err := cli.GetTransactionByID(txId)
 	assert.NoError(t, err)
@@ -278,54 +276,4 @@ func TestNewTempConn(t *testing.T) {
 		}
 		t.Logf("offset: %s, peer: %s", offset.Offset, peer)
 	}
-}
-
-func TestClient_GetBlockHashList(t *testing.T) {
-	c := NewClient("https://arweave.net")
-	from := 1095730
-	to := 1095750
-	list, err := c.GetBlockHashList(from, to)
-	assert.NoError(t, err)
-	t.Log(list)
-}
-
-func TestClient_GetBlockHashList2(t *testing.T) {
-	// c := NewClient("https://arweave.net")
-	// peers, err := c.GetPeers()
-	// assert.NoError(t, err)
-	// pNode := NewTempConn()
-	// for _, peer := range peers {
-	// 	pNode.SetTempConnUrl("http://" + peer)
-	// 	from := 1095740
-	// 	to := 1095750
-	// 	list, err := c.GetBlockHashList(from, to)
-	// 	if err != nil {
-	// 		t.Log("err", err, "perr", peer)
-	// 		continue
-	// 	}
-	// 	t.Log(peer)
-	// 	t.Log(list)
-	// }
-}
-
-func TestClient_ConcurrentDownloadChunkData(t *testing.T) {
-	c := NewClient("https://arweave.net")
-	arId := "trMxnk1aVVb_Nafg18tstoLS6SvUOpNcoSQ2qFazWio"
-	data, err := c.ConcurrentDownloadChunkData(arId, 0)
-	// data , err := c.DownloadChunkData(arId)
-	assert.NoError(t, err)
-	ioutil.WriteFile("nannan.gif", data, 0666)
-	chunks, err := utils.GenerateChunks(data)
-	assert.NoError(t, err)
-	dataRoot := utils.Base64Encode(chunks.DataRoot)
-	t.Log(dataRoot)
-	t.Log(len(data))
-}
-
-func TestClient_ExistTxData(t *testing.T) {
-	c := NewClient("https://arweave.net")
-	arId := "trMxnk1aVVb_Nafg18tstoLS6SvUOpNcoSQ2qFazWio"
-	exist, err := c.ExistTxData(arId)
-	assert.NoError(t, err)
-	t.Log(exist)
 }

@@ -49,14 +49,58 @@ func (c *Client) GetTxDataFromPeers(txId string, peers ...string) ([]byte, error
 	pNode := NewTempConn()
 	for _, peer := range peers {
 		pNode.SetTempConnUrl("http://" + peer)
-		data, err := pNode.DownloadChunkData(txId)
-		if err != nil {
+		data, downErr := pNode.DownloadChunkData(txId)
+		if downErr != nil {
+			err = downErr
 			continue
 		}
 		return data, nil
 	}
 
-	return nil, errors.New("get tx data from peers failed")
+	return nil, err
+}
+
+func (c *Client) GetTxDataFromPeersWithBreaker(txId string) ([]byte, error) {
+	var err error
+	if c.peers == nil || c.peers.Len() == 0 {
+		return nil, fmt.Errorf("peers is empty")
+	}
+	for i := 0; i < c.peers.Len(); i++ {
+		c.lock.Lock()
+		c.peers = c.peers.Next()
+		peer := c.peers.Value.(string)
+		log.Info("GetTxDataFromPeersWithBreaker", "peer", peer)
+		c.lock.Unlock()
+		//e, b := sentinel.Entry(peer)
+		//if b != nil {
+		//	continue
+		//}
+		//if e != nil {
+		rst, internalErr := c.GetTxDataFromPeers(txId, []string{peer}...)
+		//e.Exit()
+		c.lock.Lock()
+		ps, ok := c.PeerStatus[peer]
+		if !ok {
+			ps = &PeerStatus{}
+			c.PeerStatus[peer] = ps
+		}
+		ps.Count += 1
+		log.Info("GetTxDataFromPeersWithBreaker", "count", ps.Count)
+		if internalErr != nil || len(rst) == 0 {
+			//sentinel.TraceError(e, internalErr)
+			ps.FailCount += 1
+			log.Info("GetTxDataFromPeersWithBreaker", "FailCount", ps.FailCount, "errmsg", internalErr)
+			c.lock.Unlock()
+			continue
+		} else {
+			ps.SucCount += 1
+			log.Info("GetTxDataFromPeersWithBreaker", "SucCount", ps.SucCount)
+			c.lock.Unlock()
+			return rst, internalErr
+		}
+	}
+	//}
+	return nil, err
 }
 
 func (c *Client) GetBlockFromPeers(height int64, peers ...string) (*types.Block, error) {

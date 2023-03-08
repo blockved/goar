@@ -1,15 +1,11 @@
 package goar
 
 import (
-	"context"
 	"errors"
 	"fmt"
-	"github.com/panjf2000/ants/v2"
 	"math"
 	"math/rand"
-	"os"
 	"strconv"
-	"sync"
 	"time"
 
 	"github.com/everFinance/goar/types"
@@ -32,7 +28,6 @@ type TransactionUploader struct {
 	TxPosted           bool
 	Transaction        *types.Transaction
 	Data               []byte
-	DataReader         *os.File
 	LastRequestTimeEnd int64
 	TotalErrors        int // Not serialized.
 	LastResponseStatus int
@@ -50,7 +45,6 @@ func newUploader(tt *types.Transaction, client *Client) (*TransactionUploader, e
 	tu := &TransactionUploader{
 		Client: client,
 	}
-	// empty data is fine
 	da, err := utils.Base64Decode(tt.Data)
 	if err != nil {
 		log.Error("utils.Base64Decode(tt.Data)", "err", err)
@@ -58,9 +52,6 @@ func newUploader(tt *types.Transaction, client *Client) (*TransactionUploader, e
 
 	}
 	tu.Data = da
-	if tt.DataReader != nil {
-		tu.DataReader = tt.DataReader
-	}
 	tu.Transaction = &types.Transaction{
 		Format:    tt.Format,
 		ID:        tt.ID,
@@ -157,86 +148,6 @@ func (tt *TransactionUploader) PctComplete() float64 {
 	return math.Trunc(fval * 100)
 }
 
-func (tt *TransactionUploader) ConcurrentOnce(ctx context.Context, concurrentNum int) error {
-	// post tx info
-	if err := tt.postTransaction(); err != nil {
-		return err
-	}
-
-	if tt.IsComplete() {
-		return nil
-	}
-
-	var wg sync.WaitGroup
-	if concurrentNum <= 0 {
-		concurrentNum = types.DEFAULT_CHUNK_CONCURRENT_NUM
-	}
-	p, _ := ants.NewPoolWithFunc(concurrentNum, func(i interface{}) {
-		defer wg.Done()
-		// process submit chunk
-		idx := i.(int)
-
-		select {
-		case <-ctx.Done():
-			log.Warn("ctx.done", "chunkIdx", idx)
-			return
-		default:
-		}
-		var chunk *types.GetChunk
-		var err error
-		if tt.DataReader != nil {
-			chunk, err = utils.GetChunkStream(*tt.Transaction, idx, tt.DataReader)
-		} else {
-			chunk, err = utils.GetChunk(*tt.Transaction, idx, tt.Data)
-		}
-		if err != nil {
-			log.Error("GetChunk error", "err", err, "idx", idx)
-			return
-		}
-		body, statusCode, err := tt.Client.SubmitChunks(chunk) // always body is errMsg
-		if statusCode == 200 {
-			return
-		}
-
-		log.Error("concurrent submitChunk failed", "chunkIdx", idx, "statusCode", statusCode, "gatewayErr", body, "httpErr", err)
-		// try again
-		retryCount := 0
-		for {
-			select {
-			case <-ctx.Done():
-				log.Warn("ctx.done", "chunkIdx", idx)
-				return
-			default:
-			}
-
-			retryCount++
-			if statusCode == 429 {
-				time.Sleep(1 * time.Second)
-			} else {
-				time.Sleep(200 * time.Millisecond)
-			}
-
-			body, statusCode, err = tt.Client.SubmitChunks(chunk)
-			if statusCode == 200 {
-				return
-			}
-			log.Warn("retry submitChunk failed", "retryCount", retryCount, "chunkIdx", idx, "statusCode", statusCode, "gatewayErr", body, "httpErr", err)
-		}
-	})
-
-	defer p.Release()
-	for i := 0; i < len(tt.Transaction.Chunks.Chunks); i++ {
-		wg.Add(1)
-		if err := p.Invoke(i); err != nil {
-			log.Error("p.Invoke(i)", "err", err, "i", i)
-			return err
-		}
-	}
-
-	wg.Wait()
-	return nil
-}
-
 /**
  * Uploads the next part of the Transaction.
  * On the first call this posts the Transaction
@@ -281,13 +192,7 @@ func (tt *TransactionUploader) UploadChunk() error {
 		return tt.postTransaction()
 	}
 
-	var chunk *types.GetChunk
-	var err error
-	if tt.DataReader != nil {
-		chunk, err = utils.GetChunkStream(*tt.Transaction, tt.ChunkIndex, tt.DataReader)
-	} else {
-		chunk, err = utils.GetChunk(*tt.Transaction, tt.ChunkIndex, tt.Data)
-	}
+	chunk, err := utils.GetChunk(*tt.Transaction, tt.ChunkIndex, tt.Data)
 	if err != nil {
 		return err
 	}
@@ -308,12 +213,7 @@ func (tt *TransactionUploader) UploadChunk() error {
 		return errors.New(fmt.Sprintf("Unable to validate chunk %d ", tt.ChunkIndex))
 	}
 	// Catch network errors and turn them into objects with status -1 and an error message.
-	var gc *types.GetChunk
-	if tt.DataReader != nil {
-		gc, err = utils.GetChunkStream(*tt.Transaction, tt.ChunkIndex, tt.DataReader)
-	} else {
-		gc, err = utils.GetChunk(*tt.Transaction, tt.ChunkIndex, tt.Data)
-	}
+	gc, err := utils.GetChunk(*tt.Transaction, tt.ChunkIndex, tt.Data)
 	if err != nil {
 		return err
 	}
@@ -358,10 +258,7 @@ func (tt *TransactionUploader) FromSerialized(serialized *SerializedUploader, da
 	upload.TxPosted = serialized.txPosted
 	upload.Data = data
 
-	err = utils.PrepareChunks(upload.Transaction, data, len(data))
-	if err != nil {
-		return nil, err
-	}
+	utils.PrepareChunks(upload.Transaction, data)
 
 	if upload.Transaction.DataRoot != serialized.transaction.DataRoot {
 		return nil, errors.New("Data mismatch: Uploader doesn't match provided Data.")

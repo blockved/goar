@@ -3,8 +3,6 @@ package goar
 import (
 	"crypto/sha256"
 	"errors"
-	"io"
-
 	"github.com/everFinance/goar/types"
 	"github.com/everFinance/goar/utils"
 	"github.com/everFinance/goether"
@@ -39,39 +37,7 @@ func (i *ItemSigner) CreateAndSignItem(data []byte, target string, anchor string
 	if err := SignBundleItem(i.signType, i.signer, bundleItem); err != nil {
 		return types.BundleItem{}, err
 	}
-	// get itemBinary
-	itemBinary, err := utils.GenerateItemBinary(bundleItem)
-	if err != nil {
-		return types.BundleItem{}, err
-	}
-	bundleItem.ItemBinary = itemBinary
-	return *bundleItem, nil
-}
-
-func (i *ItemSigner) CreateAndSignNestedItem(target string, anchor string, tags []types.Tag, items ...types.BundleItem) (types.BundleItem, error) {
-	bundleTags := []types.Tag{
-		{Name: "Bundle-Format", Value: "binary"},
-		{Name: "Bundle-Version", Value: "2.0.0"},
-	}
-	tags = append(tags, bundleTags...)
-
-	bundle, err := utils.NewBundle(items...)
-	if err != nil {
-		return types.BundleItem{}, err
-	}
-	return i.CreateAndSignItem(bundle.BundleBinary, target, anchor, tags)
-}
-
-func (i *ItemSigner) CreateAndSignItemStream(data io.Reader, target string, anchor string, tags []types.Tag) (types.BundleItem, error) {
-	bundleItem, err := utils.NewBundleItemStream(i.owner, i.signType, target, anchor, data, tags)
-	if err != nil {
-		return types.BundleItem{}, err
-	}
-	// sign
-	if err := SignBundleItem(i.signType, i.signer, bundleItem); err != nil {
-		return types.BundleItem{}, err
-	}
-	if _, err := bundleItem.DataReader.Seek(0, 0); err != nil {
+	if err := utils.GenerateItemBinary(bundleItem); err != nil {
 		return types.BundleItem{}, err
 	}
 	return *bundleItem, nil

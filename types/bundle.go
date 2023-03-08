@@ -1,9 +1,5 @@
 package types
 
-import (
-	"os"
-)
-
 const (
 	ArweaveSignType  = 1
 	ED25519SignType  = 2
@@ -41,9 +37,8 @@ var SigConfigMap = map[int]SigMeta{
 }
 
 type Bundle struct {
-	Items            []BundleItem `json:"items"`
-	BundleBinary     []byte
-	BundleDataReader *os.File
+	Items        []BundleItem `json:"items"`
+	BundleBinary []byte
 }
 
 type BundleItem struct {
@@ -56,6 +51,5 @@ type BundleItem struct {
 	Data          string `json:"data"`
 	Id            string `json:"id"`
 
-	ItemBinary []byte   `json:"-"`
-	DataReader *os.File `json:"-"`
+	ItemBinary []byte `json:"-"`
 }
